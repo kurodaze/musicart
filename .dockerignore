@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.cargo/
+data/
+musicart.toml
+*cookies*.txt
+spotify-login*.json
+musicart
+musicart-*
+*.tmp
+*.log

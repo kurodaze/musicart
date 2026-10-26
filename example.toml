@@ -1,0 +1,20 @@
+# Copy to musicart.toml and put in a token per bot. Anything left out uses the default shown.
+# Restart after changes.
+
+log_level = "info"                # error, warn, info or debug
+idle_timeout = 900                # seconds without playing to anyone before leaving voice; 0 = never
+track_status = true               # show the playing track as the bot's status
+announce_tracks = false           # post "Now playing" in chat when a track starts by itself
+# dj_role_ids = [123456789012345678]  # roles that always control playback; without it everyone does, see the README
+# stun = "stun.cloudflare.com:3478"  # only on networks that filter Discord voice, see the README
+# togematch_api = "http://192.168.1.10:7094"  # optional togematch-api for Spotify links and searches, see the README
+# spotify = true  # Spotify's own audio on a Premium account; the log shows a link to sign in, see the README
+
+# One section per bot, all run by this one process.
+[bot.destiny]
+token = "YOUR_DISCORD_BOT_TOKEN"
+prefix = "d."                     # text commands like d.play; leave out for slash commands only
+
+[bot.titan]
+token = "ANOTHER_BOT_TOKEN"
+prefix = "t."

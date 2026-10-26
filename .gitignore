@@ -1,0 +1,12 @@
+/target
+/data
+*.toml
+!example.toml
+!Cargo.toml
+!.cargo/config.toml
+!.cargo/audit.toml
+*cookies*.txt
+spotify-login*.json
+/musicart
+/musicart-*
+/musicart.tmp

@@ -1,0 +1,15 @@
+services:
+  musicart:
+    image: ghcr.io/kurodaze/musicart:latest
+    container_name: musicart
+    restart: unless-stopped
+    init: true
+    # must read musicart.toml and own data/: your `id -u`:`id -g` if that isn't 1000
+    user: "1000:1000"
+    # userns_mode: keep-id   # rootless Podman
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./musicart.toml:/app/musicart.toml:ro,Z
+      # yt-dlp, the Spotify login and the cookies file
+      - ./data:/app/data:Z

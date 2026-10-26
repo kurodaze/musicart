@@ -1,0 +1,72 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+ignore = [
+    # rustls-webpki 0.102.8: CRL handling (RUSTSEC-2026-0049, RUSTSEC-2026-0104) and name constraints
+    # for URI and wildcard names (RUSTSEC-2026-0098, RUSTSEC-2026-0099).
+    # Transitive via rustls 0.22 (serenity 0.12's tokio-tungstenite 0.21, and librespot-core's hyper-proxy2),
+    # which needs 0.102; fixed in 0.103.
+    # musicart loads no CRLs, and the name constraint issues need a name-constrained CA to issue a
+    # certificate for a Discord host outside its constraints.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # rustls-webpki 0.102.8: paths through distrusted emSign intermediates (RUSTSEC-2026-0382), fixed only
+    # in 0.103.16. Same users as above. They trust webpki-roots, which dropped the emSign root in 1.0.10.
+    "RUSTSEC-2026-0382",
+
+    # ringbuf 0.4.8: double free in Consumer::skip/clear when an element's Drop panics (RUSTSEC-2026-0293).
+    # Via songbird, fixed only in ringbuf 0.5. songbird's buffer holds u8, whose Drop can't panic.
+    "RUSTSEC-2026-0293",
+
+    # libcrux-sha3 0.0.8 (RUSTSEC-2026-0207, RUSTSEC-2026-0208) and libcrux-secrets 0.0.5 (RUSTSEC-2026-0212).
+    # Via songbird's voice encryption: davey -> openmls -> hpke-rs 0.6.1, which pins them.
+    # hpke-rs only calls SHAKE-256 for X-Wing and ML-KEM keys; DAVE uses MLS_128_DHKEMP256_AES128GCM_SHA256_P256.
+    "RUSTSEC-2026-0207",
+    "RUSTSEC-2026-0208",
+    "RUSTSEC-2026-0212",
+
+    # libcrux-kem, libcrux-aesgcm and libcrux-chacha20poly1305 0.0.7: in the lockfile through hpke-rs's
+    # optional libcrux backend, which isn't enabled, so they aren't compiled.
+    "RUSTSEC-2026-0124",
+    "RUSTSEC-2026-0209",
+    "RUSTSEC-2026-0210",
+    "RUSTSEC-2026-0211",
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+
+    # rustls 0.22.4: TLS secrets in `Debug` output of client session values (RUSTSEC-2026-0346) and an
+    # unauthenticated downgrade from post-quantum key exchange (RUSTSEC-2026-0349).
+    # Via serenity 0.12's tokio-tungstenite and librespot-core's hyper-proxy2, with no fix for 0.22.
+    # Nothing here formats session values with `Debug`, and 0.22 has no post-quantum key exchange to
+    # downgrade from.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+
+    # quick-xml 0.38.4: memory and CPU exhaustion from hostile XML (RUSTSEC-2026-0194, RUSTSEC-2026-0195).
+    # Via librespot-core 0.8, which needs 0.38; fixed in 0.41. librespot only parses XML from
+    # Spotify's own servers.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # rsa 0.9.10: private-key timing side channel (RUSTSEC-2023-0071), no fix released.
+    # Via librespot-core, which only verifies Spotify's signature with a public key.
+    "RUSTSEC-2023-0071",
+
+    # crypto-bigint 0.5.5: timing variability in constant-time operations (RUSTSEC-2026-0387).
+    # Via songbird -> davey 0.1.5 -> openmls -> p256 0.13 -> elliptic-curve 0.13; fixed only in 0.7.6.
+    # davey uses RustCrypto for Discord DAVE voice encryption key agreements.
+    "RUSTSEC-2026-0387",
+
+    # Unmaintained, no known vulnerability: instant (RUSTSEC-2024-0384, via openmls's parking_lot 0.11),
+    # derivative (RUSTSEC-2024-0388, via songbird), proc-macro-error2 (RUSTSEC-2026-0173, a build-time
+    # dependency of libcrux's hax-lib macros) and rustls-pemfile (RUSTSEC-2025-0134, via librespot's
+    # hyper-rustls 0.26).
+    "RUSTSEC-2024-0384",
+    "RUSTSEC-2024-0388",
+    "RUSTSEC-2026-0173",
+    "RUSTSEC-2025-0134",
+]
