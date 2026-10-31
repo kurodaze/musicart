@@ -32,7 +32,7 @@ Or run directly:
 podman run -d --name musicart --restart unless-stopped --init --user 1000:1000 --userns=keep-id -v ./musicart.toml:/app/musicart.toml:ro,Z -v ./data:/app/data:Z ghcr.io/kurodaze/musicart:latest
 
 # Docker
-docker run -d --name musicart --restart unless-stopped --init --user 1000:1000 -v ./musicart.toml:/app/musicart.toml:ro -v ./data:/app/data ghcr.io/kurodaze/musicart:latest
+docker run -d --name musicart --restart unless-stopped --init --user 1000:1000 --add-host=host.docker.internal:host-gateway -v ./musicart.toml:/app/musicart.toml:ro -v ./data:/app/data ghcr.io/kurodaze/musicart:latest
 ```
 
 `compose.dev.yaml` builds the image from the checkout instead, with the faster-to-build dev profile.
@@ -127,6 +127,18 @@ Links to other sites are refused, since yt-dlp would fetch them from inside your
 With a [Spotify login](#spotify-audio), Spotify links and searches for a track play Spotify's own audio instead.
 
 Optionally, set `togematch_api` and Spotify links and searches go to that togematch-api. It keeps every match per recording, so a track is searched for on YouTube once however it's asked for; a search that names a track plays that track's recording instead of YouTube's top result; and wrong matches can be fixed with its CLI. If it can't be reached, musicart searches YouTube itself for the next minute. With Spotify audio on, it's only asked about what Spotify doesn't play: searches Spotify finds no track for, and tracks Spotify won't play.
+
+If musicart runs in Docker and togematch-api runs on the host (or in its own container publishing `7094:7094`), `localhost` points to the container itself, so use `host.docker.internal`:
+
+```toml
+togematch_api = "http://host.docker.internal:7094"
+```
+
+If both containers share a Docker network, you can use the service name instead:
+
+```toml
+togematch_api = "http://togematch-api:7094"
+```
 
 While a track plays, the next one is looked up, so tracks follow each other without a gap. Stream links are remembered in memory for 3 hours, and what searches and links found and YouTube matches for a day, so playing something again doesn't look it up again. Tracks that aren't on YouTube and videos that are gone are remembered for a day too, so they're skipped at once, and a match whose video is gone is looked up again. The same lookup asked for twice at once runs once. If a track's stream fails, the track gets a fresh one and carries on where it stopped, and if that fails too it's skipped. A lookup that fails in a way that may pass, like a dropped connection, is tried once more after 2 seconds.
 

@@ -7,7 +7,7 @@ track_status = true               # show the playing track as the bot's status
 announce_tracks = false           # post "Now playing" in chat when a track starts by itself
 # dj_role_ids = [123456789012345678]  # roles that always control playback; without it everyone does, see the README
 # stun = "stun.cloudflare.com:3478"  # only on networks that filter Discord voice, see the README
-# togematch_api = "http://192.168.1.10:7094"  # optional togematch-api for Spotify links and searches, see the README
+# togematch_api = "http://192.168.1.10:7094"  # optional togematch-api (or "http://host.docker.internal:7094" in Docker), see the README
 # spotify = true  # Spotify's own audio on a Premium account; the log shows a link to sign in, see the README
 
 # One section per bot, all run by this one process.
