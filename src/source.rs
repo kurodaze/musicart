@@ -270,6 +270,36 @@ impl Drop for Cookies {
     }
 }
 
+/// A SoundCloud audio stream from yt-dlp, with its own isolated temporary directory for
+/// HLS fragments.
+struct SoundCloudStream {
+    child: Option<songbird::input::ChildContainer>,
+    dir: PathBuf,
+}
+
+impl io::Read for SoundCloudStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.child {
+            Some(child) => child.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl Drop for SoundCloudStream {
+    fn drop(&mut self) {
+        drop(self.child.take());
+        let dir = self.dir.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = fs::remove_dir_all(dir);
+            });
+        } else {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// Everything finding audio needs.
 pub struct Finder {
     pub ytdlp: Ytdlp,
@@ -954,24 +984,37 @@ impl Track {
                 error!("yt-dlp: {e}");
                 NO_YTDLP
             })?;
-            let mut command = std::process::Command::new(tools::YTDLP);
+            static SC_RUNS: AtomicU64 = AtomicU64::new(0);
+            let run = SC_RUNS.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("musicart-sc-{}-{run}", std::process::id()));
+            fs::create_dir_all(&dir).map_err(|e| format!("couldn't create temp dir: {e}"))?;
+
+            let ytdlp =
+                fs::canonicalize(tools::YTDLP).unwrap_or_else(|_| PathBuf::from(tools::YTDLP));
+            let mut command = std::process::Command::new(ytdlp);
             command
+                .current_dir(&dir)
                 .args(["-q", "-o", "-", "-f", SOUNDCLOUD_FORMAT, "--", url])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
-            let child = command
-                .spawn()
-                .map_err(|e| format!("couldn't start yt-dlp: {e}"))?;
-            let container = songbird::input::ChildContainer::from(child);
-            if eq == Preset::Off {
-                return Ok(container.into());
-            }
-            debug!("EQ: applying preset {eq:?} to {:?}", self.title);
+            let child = command.spawn().map_err(|e| {
+                let _ = fs::remove_dir_all(&dir);
+                format!("couldn't start yt-dlp: {e}")
+            })?;
+            let stream = SoundCloudStream {
+                child: Some(songbird::input::ChildContainer::from(child)),
+                dir,
+            };
             let audio = AudioStream {
-                input: Box::new(symphonia::core::io::ReadOnlySource::new(container))
+                input: Box::new(symphonia::core::io::ReadOnlySource::new(stream))
                     as Box<dyn MediaSource>,
             };
+            if eq == Preset::Off {
+                return Ok(Input::Live(LiveInput::Raw(audio), None));
+            }
+            debug!("EQ: applying preset {eq:?} to {:?}", self.title);
             return tokio::task::spawn_blocking(move || eq::open(audio, eq))
                 .await
                 .map_err(|e| e.to_string())?;

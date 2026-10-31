@@ -15,7 +15,7 @@ FROM alpine:3.24
 # yt-dlp itself is downloaded into data/bin on the first start, and kept current there.
 RUN apk add --no-cache ca-certificates deno && \
     adduser -u 1000 -D musicart && \
-    mkdir -p /app/data && chown musicart:musicart /app/data
+    mkdir -p /app/data && chown -R musicart:musicart /app
 COPY --from=builder /musicart /app/musicart
 COPY LICENSE /app/LICENSE
 WORKDIR /app
