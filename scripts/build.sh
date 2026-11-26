@@ -94,8 +94,22 @@ PROFILE_DIR="release"
 
 echo -e "${YELLOW}Profile: $MODE | Arch: $ARCH | Target: $TARGET${NC}"
 
+CARGO_EXTRA_ARGS=()
+LOCAL_TOGEMATCH="$(cd "$ROOT_DIR/.." && pwd)/togematch"
+LOCK_BACKUP=""
+if [ "$MODE" = "dev" ] && [ -f "$LOCAL_TOGEMATCH/Cargo.toml" ]; then
+    echo -e "${YELLOW}Using local togematch: $LOCAL_TOGEMATCH${NC}"
+    CARGO_EXTRA_ARGS+=(--config "patch.crates-io.togematch.path=\"$LOCAL_TOGEMATCH\"")
+    # Preserve Cargo.lock so local dev patches never dirty the lockfile.
+    LOCK_BACKUP="$(mktemp)"
+    cp "$ROOT_DIR/Cargo.lock" "$LOCK_BACKUP"
+    trap 'if [ -n "$LOCK_BACKUP" ] && [ -f "$LOCK_BACKUP" ]; then mv -f "$LOCK_BACKUP" "$ROOT_DIR/Cargo.lock"; fi' EXIT
+    # Pick up local version bumps (e.g. 0.1.0 -> 0.1.1) so Cargo does not skip the patch.
+    cargo update --manifest-path "$ROOT_DIR/Cargo.toml" --offline "${CARGO_EXTRA_ARGS[@]}" -p togematch
+fi
+
 echo -e "${GREEN}Building...${NC}"
-cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --target "$TARGET" --profile "$MODE"
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --target "$TARGET" --profile "$MODE" "${CARGO_EXTRA_ARGS[@]}"
 
 # Naming: musicart[-dev][-aarch64]
 DEV_SUFFIX=""

@@ -15,7 +15,7 @@ use songbird::input::{AudioStream, Compose, HttpRequest, Input, LiveInput};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,20 +59,15 @@ const LINK_TRIES: usize = 3;
 /// When the last yt-dlp lookup started.
 static LAST_LOOKUP: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::const_new(None);
 
-pub static ACTIVE_COOKIES: Mutex<Option<String>> = Mutex::new(None);
+static ACTIVE_COOKIES: Mutex<Option<String>> = Mutex::new(None);
 
-/// yt-dlp, and the cookies of a logged-in YouTube account if set. YouTube trusts a
+/// yt-dlp, using any cookies file in `data/` when YouTube asks to sign in. YouTube trusts a
 /// logged-in session much more, but its lookups are slower and its links take a moment to work,
 /// so the cookies are only used for a while after YouTube asks to sign in.
-pub struct Ytdlp {
-    pub cookies: Option<String>,
-}
+pub struct Ytdlp;
 
 impl Ytdlp {
     pub fn cookies_file(&self) -> Option<String> {
-        if let Some(file) = &self.cookies {
-            return Some(file.clone());
-        }
         crate::find_cookies(crate::DATA).map(|p| p.to_string_lossy().into_owned())
     }
 }
@@ -178,7 +173,9 @@ impl Ytdlp {
             let mut active = ACTIVE_COOKIES.lock().unwrap_or_else(|e| e.into_inner());
             if *active != cookies_path {
                 if let Some(path) = &cookies_path {
-                    info!("cookies: loaded from {path}");
+                    info!("using YouTube cookies from {path}");
+                } else if active.is_some() {
+                    warn!("YouTube cookies file removed; continuing without cookies");
                 }
                 *active = cookies_path.clone();
             }
@@ -200,7 +197,9 @@ impl Ytdlp {
 
     /// Logs once when YouTube stops accepting the cookies. yt-dlp then carries on logged out.
     fn check_cookies(&self, out: &Output) {
-        let dead = String::from_utf8_lossy(&out.stderr).contains("cookies are no longer valid");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let dead = stderr.contains("cookies are no longer valid")
+            || stderr.contains("Your cookies are expired");
         if dead && !COOKIES_DEAD.swap(true, Ordering::Relaxed) {
             let cookies_path = self.cookies_file();
             let file = cookies_path.as_deref().unwrap_or_default();
@@ -223,6 +222,8 @@ impl Cookies {
     fn copy(file: &str) -> io::Result<Self> {
         static RUNS: AtomicU64 = AtomicU64::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
+        // Deployed under PrivateTmp=yes or a container's own /tmp; create_new + 0o600 prevents
+        // symlink/read exposure even on shared /tmp without assuming /dev/shm is mounted.
         let copy =
             std::env::temp_dir().join(format!("musicart-{}-{run}.cookies", std::process::id()));
         let read = {
@@ -256,9 +257,23 @@ impl Cookies {
             return;
         }
         let _turn = COOKIES_TURN.lock().unwrap();
-        if fs::read(&self.file).is_ok_and(|now| now == self.read)
-            && let Err(e) = fs::write(&self.file, learned)
-        {
+        if !fs::read(&self.file).is_ok_and(|now| now == self.read) {
+            return;
+        }
+        let tmp = format!("{}.tmp", self.file);
+        let _ = fs::remove_file(&tmp);
+        let write = (|| -> io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(&learned)?;
+            file.sync_all()?;
+            fs::rename(&tmp, &self.file)
+        })();
+        if let Err(e) = write {
+            let _ = fs::remove_file(&tmp);
             warn!("cookies: couldn't save {}: {e}", self.file);
         }
     }
@@ -577,7 +592,8 @@ pub async fn find(finder: &Finder, query: &str) -> Result<Found, String> {
         && let Some(api) = finder.api_up()
     {
         debug!("lookup: asking togematch-api at {api} for {query:?}");
-        match ask_api(finder, api, query).await {
+        let spotify_ref = spotify.as_ref().map(|(k, id)| (k.as_str(), id.as_str()));
+        match ask_api(finder, api, query, spotify_ref).await {
             Ok(Some(found)) => return Ok(found),
             // it searched already, so searching again here would find the same
             Ok(None) if spotify.is_some() => return Err("Not on YouTube".into()),
@@ -611,7 +627,7 @@ pub async fn find(finder: &Finder, query: &str) -> Result<Found, String> {
         if info.kind.as_deref() != Some("playlist") {
             let title = info.shown_title();
             let page = info.webpage_url.unwrap_or_else(|| url.clone());
-            let duration = info.duration.map(Duration::from_secs_f64);
+            let duration = secs_to_duration(info.duration);
             debug!("lookup SoundCloud: {title:?} ({duration:?}, page: {page})");
             finder
                 .found
@@ -628,7 +644,7 @@ pub async fn find(finder: &Finder, query: &str) -> Result<Found, String> {
             .entries
             .into_iter()
             .filter_map(|e| {
-                let duration = e.duration.map(Duration::from_secs_f64);
+                let duration = secs_to_duration(e.duration);
                 e.title.as_ref()?;
                 let title = e.shown_title();
                 let url = e.url?;
@@ -705,7 +721,7 @@ pub async fn find(finder: &Finder, query: &str) -> Result<Found, String> {
         .entries
         .into_iter()
         .filter_map(|e| {
-            let duration = e.duration.map(Duration::from_secs_f64);
+            let duration = secs_to_duration(e.duration);
             e.title.as_ref()?;
             let title = e.shown_title();
             let url = e.url?;
@@ -765,7 +781,7 @@ pub async fn stream(
             break link;
         }
         if !finder.ytdlp.logged_in() && finder.ytdlp.cookies_file().is_some() {
-            info!("YouTube refused stream link, activating cookies for lookups");
+            info!("YouTube refused a stream link, so lookups use the cookies for the next hour");
             *ASKED.lock().unwrap() = Some(Instant::now());
         }
         info!("YouTube cut the stream link for {page} short, getting another");
@@ -782,7 +798,7 @@ async fn page_of(finder: &Finder, lookup: &Lookup) -> Result<String, String> {
         Lookup::Page(url) | Lookup::SoundCloud(url) => url.clone(),
         Lookup::Match(wanted) => match_here(finder, wanted).await?,
         Lookup::Api(query, wanted) => match finder.api_up() {
-            Some(api) => match ask_api(finder, api, query).await {
+            Some(api) => match ask_api(finder, api, query, None).await {
                 Ok(found) => found
                     .and_then(|f| f.tracks.into_iter().next())
                     .map(|t| t.lookup)
@@ -851,7 +867,7 @@ impl Track {
     fn from_video(info: Info) -> Result<Track, String> {
         let title = info.shown_title();
         let url = info.webpage_url.clone().ok_or("yt-dlp gave no link")?;
-        let duration = info.duration.map(Duration::from_secs_f64);
+        let duration = secs_to_duration(info.duration);
         let mut track = Track::new(title, url.clone(), duration, Lookup::Page(url));
         track.stream = Some(Stream::from_video(info)?);
         Ok(track)
@@ -988,7 +1004,10 @@ impl Track {
             let run = SC_RUNS.fetch_add(1, Ordering::Relaxed);
             let dir =
                 std::env::temp_dir().join(format!("musicart-sc-{}-{run}", std::process::id()));
-            fs::create_dir_all(&dir).map_err(|e| format!("couldn't create temp dir: {e}"))?;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("couldn't create temp dir: {e}"))?;
 
             let ytdlp =
                 fs::canonicalize(tools::YTDLP).unwrap_or_else(|_| PathBuf::from(tools::YTDLP));
@@ -1072,7 +1091,7 @@ impl Stream {
             }
             debug!("stream link refused its last byte");
             // If byte 0 is served but the last byte was refused, YouTube truncated the stream.
-            if !self.refuses(http, 0).await {
+            if last > 0 && !self.refuses(http, 0).await {
                 return false;
             }
             // If both byte 0 and the last byte are refused, the link is in YouTube's initial
@@ -1107,7 +1126,7 @@ impl Stream {
             })
             .collect();
         let url = info.url.ok_or("yt-dlp found no audio")?;
-        let length = info.duration.map(Duration::from_secs_f64);
+        let length = secs_to_duration(info.duration);
         Ok(Stream {
             url,
             headers,
@@ -1119,9 +1138,19 @@ impl Stream {
     }
 }
 
+/// Converts a yt-dlp duration in seconds without panicking on negative, NaN or overflow values.
+fn secs_to_duration(secs: Option<f64>) -> Option<Duration> {
+    secs.and_then(|d| Duration::try_from_secs_f64(d).ok())
+}
+
 /// Asks togematch-api about a Spotify link or a search: none if it found nothing. One it can't
 /// reach is skipped for [`API_DOWN_FOR`], so lookups don't each wait for it.
-async fn ask_api(finder: &Finder, api: &str, query: &str) -> Result<Option<Found>, String> {
+async fn ask_api(
+    finder: &Finder,
+    api: &str,
+    query: &str,
+    spotify: Option<(&str, &str)>,
+) -> Result<Option<Found>, String> {
     let response = finder
         .api_http
         .get(format!("{api}/match"))
@@ -1144,12 +1173,12 @@ async fn ask_api(finder: &Finder, api: &str, query: &str) -> Result<Option<Found
             .unwrap_or(status.as_str())
             .to_string());
     }
-    Ok(from_api(&answer, query))
+    Ok(from_api(&answer, spotify, query))
 }
 
 /// togematch-api's answer as tracks, none if it found nothing. List entries it hasn't matched yet
 /// are asked for again when they come up; tracks it found nothing for are dropped.
-fn from_api(answer: &Value, query: &str) -> Option<Found> {
+fn from_api(answer: &Value, spotify: Option<(&str, &str)>, query: &str) -> Option<Found> {
     let tracks: Vec<Track> = answer["tracks"]
         .as_array()
         .into_iter()
@@ -1195,28 +1224,34 @@ fn from_api(answer: &Value, query: &str) -> Option<Found> {
         })
         .collect();
     let playlist = answer["playlist"].as_str().map(|title| {
-        let (url, kind) = if query.contains("/album/") || query.starts_with("spotify:album:") {
-            let id = query
-                .split('/')
-                .next_back()
-                .unwrap_or(query)
-                .strip_prefix("spotify:album:")
-                .unwrap_or(query);
-            (
+        let parsed = spotify.or_else(|| {
+            if let Some(id) = query.strip_prefix("spotify:album:") {
+                Some(("album", id))
+            } else if let Some(id) = query.strip_prefix("spotify:playlist:") {
+                Some(("playlist", id))
+            } else {
+                let base = query.split(['?', '#']).next().unwrap_or(query);
+                let id = base.trim_end_matches('/').rsplit('/').next()?;
+                let kind = if base.contains("/album/") {
+                    "album"
+                } else if base.contains("/playlist/") {
+                    "playlist"
+                } else {
+                    return None;
+                };
+                Some((kind, id))
+            }
+        });
+        let (url, kind) = match parsed {
+            Some(("album", id)) => (
                 format!("https://open.spotify.com/album/{id}"),
                 "Spotify album",
-            )
-        } else {
-            let id = query
-                .split('/')
-                .next_back()
-                .unwrap_or(query)
-                .strip_prefix("spotify:playlist:")
-                .unwrap_or(query);
-            (
+            ),
+            Some((_, id)) => (
                 format!("https://open.spotify.com/playlist/{id}"),
                 "Spotify playlist",
-            )
+            ),
+            None => (String::new(), "Spotify playlist"),
         };
         Playlist {
             title: title.to_string(),
@@ -1568,9 +1603,10 @@ async fn run(ytdlp: &Ytdlp, args: &[&str], limit: Duration) -> Result<Output, St
             debug!("yt-dlp: completed (stdout: {} bytes)", out.stdout.len());
             return Ok(out);
         }
+        let err = failure(&out);
         if !logged_in
             && ytdlp.cookies_file().is_some()
-            && failure(&out).contains("Sign in to confirm you")
+            && (err.contains("Sign in to confirm you") || err.contains("confirm your age"))
         {
             info!("YouTube asked to sign in, so lookups use the cookies for the next hour");
             *ASKED.lock().unwrap() = Some(Instant::now());
@@ -1580,17 +1616,14 @@ async fn run(ytdlp: &Ytdlp, args: &[&str], limit: Duration) -> Result<Output, St
             && String::from_utf8_lossy(&out.stderr).contains(OUTDATED)
             && ytdlp.update(UPDATE_GAP).await
         {
-            info!(
-                "yt-dlp: trying again with its new version, after: {}",
-                failure(&out)
-            );
+            info!("yt-dlp: trying again with its new version, after: {err}");
             updated = true;
             continue;
         }
-        if retried || lasting(&failure(&out)) {
+        if retried || lasting(&err) {
             return Ok(out);
         }
-        warn!("yt-dlp: {}, trying again", failure(&out));
+        warn!("yt-dlp: {err}, trying again");
         retried = true;
         tokio::time::sleep(RETRY_DELAY).await;
     }
@@ -1610,6 +1643,7 @@ fn failure(out: &Output) -> String {
 fn lasting(error: &str) -> bool {
     const LASTING: &[&str] = &[
         "Sign in to confirm you",
+        "confirm your age",
         "This live event will begin",
         "Premieres in",
         "Unsupported URL",
@@ -1804,8 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_links_are_refused() {
-        let ytdlp = Ytdlp { cookies: None };
-        let finder = Finder::new(ytdlp, None, None);
+        let finder = Finder::new(Ytdlp, None, None);
         for other in [
             "http://192.168.1.1/reboot",
             "spotify:artist:0gxyHStUsqpMadRV0Di1Qt",
@@ -1825,10 +1858,43 @@ mod tests {
                 {"title": "Gone", "artist": "Nobody", "duration": 1000, "youtube": null, "source": "none", "cached": true, "query": "spotify:track:def"}
             ]
         });
-        let found = from_api(&answer, "spotify:playlist:abc").unwrap();
+        let found = from_api(&answer, None, "spotify:playlist:abc").unwrap();
         assert_eq!(
-            found.playlist.as_ref().map(|p| p.title.as_str()),
-            Some("Global Warming")
+            found
+                .playlist
+                .as_ref()
+                .map(|p| (p.title.as_str(), p.url.as_str(), p.kind)),
+            Some((
+                "Global Warming",
+                "https://open.spotify.com/playlist/abc",
+                "Spotify playlist"
+            ))
+        );
+        let https_album = from_api(
+            &answer,
+            None,
+            "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy?si=abc123",
+        )
+        .unwrap();
+        assert_eq!(
+            https_album
+                .playlist
+                .as_ref()
+                .map(|p| (p.url.as_str(), p.kind)),
+            Some((
+                "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy",
+                "Spotify album"
+            ))
+        );
+        let short_link = from_api(
+            &answer,
+            Some(("playlist", "37i9dQZF1DXcBWIGoYBM5M")),
+            "https://spotify.link/abc123",
+        )
+        .unwrap();
+        assert_eq!(
+            short_link.playlist.as_ref().map(|p| p.url.as_str()),
+            Some("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M")
         );
         assert_eq!(found.tracks.len(), 2);
         assert_eq!(found.tracks[0].title, "Pitbull - Global Warming");
@@ -1839,7 +1905,7 @@ mod tests {
         assert!(matches!(&found.tracks[0].lookup, Lookup::Page(p) if p.ends_with("9ohd3dSydY8")));
         assert!(matches!(&found.tracks[1].lookup, Lookup::Api(q, _) if q == "spotify:track:abc"));
         let nothing = serde_json::json!({"playlist": null, "tracks": [{"title": "x", "artist": "", "duration": 0, "youtube": null, "source": "none", "query": "x"}]});
-        assert!(from_api(&nothing, "").is_none());
+        assert!(from_api(&nothing, None, "").is_none());
     }
 
     #[test]
@@ -1867,7 +1933,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn spotify_online() {
-        let finder = Finder::new(Ytdlp { cookies: None }, None, None);
+        let finder = Finder::new(Ytdlp, None, None);
         let found = find(
             &finder,
             "https://open.spotify.com/track/08Hty7Sm9hIExaAXcQRtdl",
@@ -1892,7 +1958,7 @@ mod tests {
     #[ignore]
     async fn api_online() {
         let api = std::env::var("MUSICART_TOGEMATCH_API").unwrap_or("http://127.0.0.1:7094".into());
-        let finder = Finder::new(Ytdlp { cookies: None }, Some(api), None);
+        let finder = Finder::new(Ytdlp, Some(api), None);
         let found = find(&finder, "basshunter dota").await.unwrap();
         let track = &found.tracks[0];
         assert_eq!(track.title, "Basshunter - DotA (Radio Edit)");
@@ -1904,7 +1970,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn soundcloud_online() {
-        let finder = Finder::new(Ytdlp { cookies: None }, None, None);
+        let finder = Finder::new(Ytdlp, None, None);
         let found = find(
             &finder,
             "https://soundcloud.com/coldfleshcolony/bitterblossom",
@@ -1941,9 +2007,9 @@ mod tests {
     #[tokio::test]
     async fn api_down_fails_fast() {
         let api = "http://127.0.0.1:9";
-        let finder = Finder::new(Ytdlp { cookies: None }, Some(api.into()), None);
+        let finder = Finder::new(Ytdlp, Some(api.into()), None);
         let started = Instant::now();
-        assert!(ask_api(&finder, api, "anything").await.is_err());
+        assert!(ask_api(&finder, api, "anything", None).await.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(finder.api_up(), None);
     }

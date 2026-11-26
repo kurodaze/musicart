@@ -6,45 +6,37 @@ It's built to be small and light. Both bots together use about 12 MB of RAM whil
 
 ## Setup
 
-It runs on Linux, x86_64 or aarch64. It needs:
+Runs on Linux (`x86_64` or `aarch64`), on a residential connection or with [YouTube cookies](#are-you-a-bot) (required on VPS/datacenter IPs, where YouTube blocks signed-out requests).
 
-- a residential internet connection, or [YouTube cookies](#are-you-a-bot) (required for VPS/datacenter IPs, where YouTube blocks signed-out requests).
+[yt-dlp](https://github.com/yt-dlp/yt-dlp/releases) and [deno](https://deno.com) are downloaded into `data/bin/` on first start and verified against their release checksums (a `deno` already on `PATH`, such as in the container, is used instead). musicart keeps yt-dlp up to date automatically: at startup, every 6 hours, and immediately when yt-dlp asks for a newer version. Delete `data/bin/yt-dlp` or `data/bin/deno` to force a re-download.
 
-[yt-dlp](https://github.com/yt-dlp/yt-dlp/releases) and [deno](https://deno.com), which yt-dlp needs for YouTube, are downloaded into `data/bin/` on the first start and checked against the checksums their releases publish. A deno on the system path is used instead if there is one (the container has one). musicart keeps yt-dlp current, since an old one stops working whenever YouTube changes: it checks for a new version at startup, every 6 hours, and right away when yt-dlp says a newer version may fix a failure. Delete a file in `data/bin/` to get a fresh copy.
+Before starting:
 
-In the Discord developer portal, create an application per bot and copy its token. Turn on the **Message Content** intent if you'll use text commands like `t.play`. Invite each bot with the `bot` and `applications.commands` scopes and the **View Channel**, **Send Messages**, **Read Message History**, **Connect** and **Speak** permissions. Set its name and avatar in the portal.
-
-Then make a `musicart.toml` from [example.toml](example.toml), with a `[bot.<name>]` section and token per bot.
+1. In the Discord developer portal, create an application per bot, set its name and avatar, and copy its token. Turn on the **Message Content** intent if you'll use text commands like `t.play`.
+2. Invite each bot with the `bot` and `applications.commands` scopes and the **View Channel**, **Send Messages**, **Embed Links**, **Read Message History**, **Connect**, and **Speak** permissions.
+3. Copy [example.toml](example.toml) to `musicart.toml` and add a `[bot.<name>]` section with each token.
 
 ### 1. Run via Podman / Docker (Recommended)
 
-The image has deno, and fetches yt-dlp into its data folder on the first start. It runs as `1000:1000` (`user:` in `compose.yaml` and below), which must be able to read `musicart.toml` and own `data/`, where musicart keeps yt-dlp, the Spotify login and the cookies file: use your own `id -u`:`id -g` if those differ. Create `data/` before the first start, or Docker creates it owned by root.
+The image has deno, and fetches yt-dlp into its data folder on the first start. It runs as `1000:1000` (`user:` in `compose.yaml`), which must be able to read `musicart.toml` and own `data/`, where musicart keeps yt-dlp, the Spotify login and the cookies file: use your own `id -u`:`id -g` if those differ. Create `data/` before the first start, or Docker creates it owned by root.
 
 ```bash
 mkdir -p data
-podman compose up -d   # with compose.yaml from this repo, next to musicart.toml; rootless Podman: uncomment userns_mode
+podman compose up -d   # rootless Podman: uncomment userns_mode in compose.yaml
 # or: docker compose up -d
-```
-
-Or run directly:
-```bash
-# Podman, rootless (SELinux compatible)
-podman run -d --name musicart --restart unless-stopped --init --user 1000:1000 --userns=keep-id -v ./musicart.toml:/app/musicart.toml:ro,Z -v ./data:/app/data:Z ghcr.io/kurodaze/musicart:latest
-
-# Docker
-docker run -d --name musicart --restart unless-stopped --init --user 1000:1000 --add-host=host.docker.internal:host-gateway -v ./musicart.toml:/app/musicart.toml:ro -v ./data:/app/data ghcr.io/kurodaze/musicart:latest
 ```
 
 `compose.dev.yaml` builds the image from the checkout instead, with the faster-to-build dev profile.
 
 ### 2. Or Install Native Binary
 
-Download a static `musicart` binary (`-x86_64` / `-aarch64`) from [GitHub Releases](https://github.com/kurodaze/musicart/releases) and check it with `sha256sum -c --ignore-missing SHA256SUMS`, or build it:
+Download a static `musicart` binary (`-x86_64` / `-aarch64`) from [GitHub Releases](https://github.com/kurodaze/musicart/releases) and check it with `sha256sum -c --ignore-missing SHA256SUMS`, or build it from source:
 
 ```bash
 # Runtime: yt-dlp, and deno unless one is on PATH, are downloaded into data/bin/ on first use.
 # Building needs Rust and cmake (for libopus, the Opus encoder).
-git clone https://github.com/kurodaze/musicart && cd musicart
+git clone https://github.com/kurodaze/musicart.git
+cd musicart
 ./scripts/build.sh --release   # a static ./musicart, see --help
 cp example.toml musicart.toml   # add a token per bot
 ./musicart   # Ctrl+C to stop
@@ -87,8 +79,8 @@ Every command is a slash command, and with a `prefix` also a text command. Prefi
 | `play <link or search>` | `p` | Joins your voice channel and plays, or adds to the queue |
 | `skip` | `s` | Skips the current track |
 | `prev` | | Plays the previous track again from the start; the current one goes back to the front of the queue |
-| `replay` | | Starts the current track over, or plays the last one again when nothing is playing |
-| `queue` | `q` | What's playing and the next 10 |
+| `replay` | `rewind` | Starts the current track over, or plays the last one again when nothing is playing |
+| `queue` | `q` | What's playing and the queue, 10 tracks per page |
 | `nowplaying` | `np` | The current track and how far in it is |
 | `pause`, `resume` | | |
 | `stop` | | Clears the queue and stops, but stays in voice |
@@ -140,7 +132,9 @@ If both containers share a Docker network, you can use the service name instead:
 togematch_api = "http://togematch-api:7094"
 ```
 
-While a track plays, the next one is looked up, so tracks follow each other without a gap. Stream links are remembered in memory for 3 hours, and what searches and links found and YouTube matches for a day, so playing something again doesn't look it up again. Tracks that aren't on YouTube and videos that are gone are remembered for a day too, so they're skipped at once, and a match whose video is gone is looked up again. The same lookup asked for twice at once runs once. If a track's stream fails, the track gets a fresh one and carries on where it stopped, and if that fails too it's skipped. A lookup that fails in a way that may pass, like a dropped connection, is tried once more after 2 seconds.
+While a track plays, the next one is preloaded so playback continues without a gap. Stream links are cached in memory for 3 hours, and search results, YouTube matches, and unavailable tracks are cached for a day; concurrent identical lookups share one request.
+
+If a stream fails mid-track, musicart fetches a fresh one and resumes where it stopped (skipping it if the retry also fails). Transient yt-dlp errors like dropped connections are retried once after 2 seconds.
 
 ## Spotify audio
 

@@ -35,7 +35,7 @@ static SYSTEM_DENO: LazyLock<bool> = LazyLock::new(|| {
 /// told with `--js-runtimes`.
 pub async fn ready() -> Result<String, String> {
     static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let missing = |path: &str| !Path::new(path).is_file();
+    let missing = |path: &str| !usable(path);
     if missing(YTDLP) || (!*SYSTEM_DENO && missing(DENO)) {
         let _turn = INSTALL.lock().await;
         let arch = match std::env::consts::ARCH {
@@ -138,6 +138,49 @@ fn unzip_single(zip: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// True if `path` exists and, when it is a dynamically linked ELF64 binary, its loader (`PT_INTERP`)
+/// exists on this host (so a musl binary from a container is replaced on a glibc host and vice versa).
+fn usable(path: &str) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let mut head = Vec::new();
+    if file.take(4096).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    elf_interp(&head).is_none_or(|interp| Path::new(interp).exists())
+}
+
+/// The `PT_INTERP` path of a little-endian ELF64 binary if it lies within `head`.
+fn elf_interp(head: &[u8]) -> Option<&str> {
+    if head.len() < 64 || &head[0..4] != b"\x7fELF" || head[4] != 2 || head[5] != 1 {
+        return None;
+    }
+    let u16_at = |i: usize| Some(u16::from_le_bytes(head.get(i..i + 2)?.try_into().ok()?));
+    let u32_at = |i: usize| Some(u32::from_le_bytes(head.get(i..i + 4)?.try_into().ok()?));
+    let u64_at = |i: usize| Some(u64::from_le_bytes(head.get(i..i + 8)?.try_into().ok()?));
+    let phoff = usize::try_from(u64_at(32)?).ok()?;
+    let phentsize = usize::from(u16_at(54)?);
+    let phnum = usize::from(u16_at(56)?);
+    if phentsize < 56 {
+        return None;
+    }
+    for i in 0..phnum {
+        let off = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if u32_at(off)? == 3 {
+            let start = usize::try_from(u64_at(off + 8)?).ok()?;
+            let size = usize::try_from(u64_at(off + 32)?).ok()?;
+            let bytes = head.get(start..start.checked_add(size)?)?;
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            return std::str::from_utf8(&bytes[..end]).ok();
+        }
+    }
+    None
+}
+
 /// The hash for `filename` in a sums file: GNU `hash  name` lines (the name may carry a path or a
 /// `*`), or a file holding just the hash.
 fn parse_sha256sums(text: &str, filename: &str) -> Option<String> {
@@ -167,6 +210,22 @@ mod tests {
         zip.extend(deflate.finish().unwrap());
         assert_eq!(unzip_single(&zip).unwrap(), b"deno binary");
         assert!(unzip_single(b"not a zip").is_err());
+    }
+
+    #[test]
+    fn elf_interp_reads_loader_path() {
+        let mut elf = vec![0u8; 256];
+        elf[0..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        elf[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        let interp = b"/lib/ld-musl-x86_64.so.1\0";
+        elf[64 + 8..64 + 16].copy_from_slice(&128u64.to_le_bytes()); // p_offset
+        elf[64 + 32..64 + 40].copy_from_slice(&(interp.len() as u64).to_le_bytes()); // p_filesz
+        elf[128..128 + interp.len()].copy_from_slice(interp);
+        assert_eq!(elf_interp(&elf), Some("/lib/ld-musl-x86_64.so.1"));
+        assert_eq!(elf_interp(b"#!/bin/sh\n"), None);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -546,20 +546,29 @@ async fn json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Re
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// Writes the login readable by this user only.
+/// Writes the login atomically and readable by this user only.
 fn save(path: &Path, refresh_token: &str) -> io::Result<()> {
     let text = serde_json::to_string(&Login {
         refresh_token: refresh_token.into(),
     })?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // an existing file keeps its mode otherwise
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(text.as_bytes())
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let write = (|| -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
 }
 
 /// A decrypted Spotify audio file, seen from where its Ogg stream starts.
@@ -601,15 +610,22 @@ impl Read for SpotifyFile {
 impl Seek for SpotifyFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let to = match pos {
-            SeekFrom::Start(at) => self.start + at,
-            SeekFrom::End(back) => (self.start + self.len).saturating_add_signed(back),
+            SeekFrom::Start(at) => self.start.saturating_add(at),
+            SeekFrom::End(back) => self
+                .start
+                .saturating_add(self.len)
+                .saturating_add_signed(back)
+                .max(self.start),
             SeekFrom::Current(by) => self
                 .audio
                 .stream_position()?
                 .saturating_add_signed(by)
                 .max(self.start),
         };
-        Ok(self.audio.seek(SeekFrom::Start(to))? - self.start)
+        Ok(self
+            .audio
+            .seek(SeekFrom::Start(to))?
+            .saturating_sub(self.start))
     }
 }
 

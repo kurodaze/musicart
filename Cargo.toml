@@ -1,6 +1,6 @@
 [package]
 name = "musicart"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -22,15 +22,17 @@ librespot-metadata = { version = "0.8", default-features = false }
 librespot-audio = { version = "0.8", default-features = false }
 # the query in a Spotify search URI
 form_urlencoded = "1"
-# Pin so librespot-core's build.rs resolves a compatible vergen stack.
-vergen = "=9.0.6"
-vergen-gitcl = "=1.0.5"
-vergen-lib = "=0.1.6"
-togematch = "0.1"
+togematch = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[build-dependencies]
+# Pin so librespot-core's build.rs resolves a compatible vergen stack.
+vergen = "=9.0.6"
+vergen-gitcl = "=1.0.5"
+vergen-lib = "=0.1.6"
 
 [profile.release]
 lto = "fat"

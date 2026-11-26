@@ -305,8 +305,12 @@ impl Equalized {
         let decoder = get_codec_registry()
             .make(&params, &DecoderOptions::default())
             .map_err(|e| format!("couldn't decode the stream: {e}"))?;
-        let rate = params.sample_rate.unwrap_or(48_000);
-        let channels = params.channels.map_or(2, |c| c.count());
+        let rate = params.sample_rate.filter(|&r| r > 0).unwrap_or(48_000);
+        let channels = params
+            .channels
+            .map(|c| c.count())
+            .filter(|&c| c > 0)
+            .unwrap_or(2);
         Ok(Equalized {
             track: track.id,
             format,

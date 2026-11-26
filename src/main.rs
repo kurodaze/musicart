@@ -77,12 +77,11 @@ async fn main() -> ExitCode {
         warn!("couldn't create {DATA}/, so a Spotify login or cookies can't be kept there: {e}");
     }
 
-    let ytdlp = source::Ytdlp { cookies: None };
+    let ytdlp = source::Ytdlp;
     if let Some(path) = ytdlp.cookies_file() {
-        info!("cookies: loaded from {path}");
-        *source::ACTIVE_COOKIES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(path);
+        info!("YouTube cookies found at {path} (used when challenged)");
+    } else {
+        tracing::debug!("no YouTube cookies found in data/");
     }
 
     let settings = Arc::new(bot::Settings {
@@ -175,7 +174,7 @@ pub fn find_cookies(dir: &str) -> Option<PathBuf> {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default()
                     .to_lowercase();
-                if name.contains("cookie") {
+                if name.contains("cookie") && !name.ends_with(".tmp") {
                     candidates.push(path);
                 }
             }
@@ -198,6 +197,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
+        assert_eq!(find_cookies(dir.to_str().unwrap()), None);
+
+        let tmp_cookie = dir.join("cookies.txt.tmp");
+        std::fs::write(&tmp_cookie, "# partial write\n").unwrap();
         assert_eq!(find_cookies(dir.to_str().unwrap()), None);
 
         let cookie_file = dir.join("www.youtube.com_cookies.txt");

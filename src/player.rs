@@ -71,8 +71,6 @@ pub struct Current {
     pub track: Track,
     pub handle: TrackHandle,
     pub paused: bool,
-    /// skipped on purpose, so looping this track doesn't bring it back
-    pub skipped: bool,
     pub started: Instant,
     pub at: Duration,
 }
@@ -235,7 +233,6 @@ impl Bot {
                     track,
                     handle,
                     paused: false,
-                    skipped: false,
                     started: Instant::now(),
                     at: start_pos,
                 });
@@ -435,15 +432,11 @@ impl songbird::EventHandler for TrackEnd {
             let mut dropped = None;
             // only the track that's playing now: ignore ones replaced or cleared on purpose
             let next = self.bot.with_guild(self.guild, |g| {
-                let Current {
-                    mut track, skipped, ..
-                } = g.current.take_if(|c| c.handle.uuid() == handle.uuid())?;
+                let Current { mut track, .. } =
+                    g.current.take_if(|c| c.handle.uuid() == handle.uuid())?;
                 debug!(
-                    "{name}: track end event for {:?} in guild {} (state: {:?}, pos: {:?}, skipped: {skipped})",
-                    track.title,
-                    self.guild,
-                    state.playing,
-                    state.position
+                    "{name}: track end event for {:?} in guild {} (state: {:?}, pos: {:?})",
+                    track.title, self.guild, state.playing, state.position
                 );
                 let failure = match &state.playing {
                     PlayMode::Errored(e) => Some(e.to_string()),
@@ -473,7 +466,7 @@ impl songbird::EventHandler for TrackEnd {
                     None => {
                         track.retried = false;
                         match g.looping {
-                            Loop::Track if !skipped => {
+                            Loop::Track => {
                                 g.queue.push_front(track);
                                 // the same track again needs no announcement
                                 g.loading = true;

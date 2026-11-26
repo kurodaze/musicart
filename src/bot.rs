@@ -2,7 +2,7 @@
 
 use crate::config;
 use crate::eq::{self, Preset};
-use crate::player::{self, Guild, Loop};
+use crate::player::{self, Current, Guild, Loop};
 use crate::source::{self, Found, clock};
 use serenity::all::{
     ButtonStyle, ChannelId, Client, Command, CommandDataOptionValue, CommandInteraction,
@@ -64,6 +64,7 @@ struct Request {
 const ALIASES: &[(&str, &str)] = &[
     ("p", "play"),
     ("s", "skip"),
+    ("rewind", "replay"),
     ("q", "queue"),
     ("np", "nowplaying"),
     ("repeat", "loop"),
@@ -72,6 +73,28 @@ const ALIASES: &[(&str, &str)] = &[
 ];
 /// Open to everyone when DJ roles are set.
 const OPEN: &[&str] = &["play", "queue", "nowplaying", "help", "ping"];
+/// Every command name, verified against [`commands`] by `command_lists_match`.
+const COMMANDS: &[&str] = &[
+    "play",
+    "skip",
+    "prev",
+    "replay",
+    "queue",
+    "nowplaying",
+    "pause",
+    "resume",
+    "stop",
+    "clear",
+    "remove",
+    "shuffle",
+    "loop",
+    "seek",
+    "volume",
+    "eq",
+    "disconnect",
+    "help",
+    "ping",
+];
 
 fn commands() -> Vec<CreateCommand> {
     let command = |name: &str, description: &str| CreateCommand::new(name).description(description);
@@ -402,51 +425,35 @@ impl Reply {
             Reply::Text {
                 http,
                 channel,
-                sent: Some(message),
-                ..
-            } => {
-                let mut edit = EditMessage::new()
-                    .content(text.unwrap_or_default())
-                    .allowed_mentions(none());
-                if let Some(e) = embed {
-                    edit = edit.embed(e).components(rows);
-                }
-                channel.edit_message(&**http, *message, edit).await?;
-                if has_buttons {
-                    let (http, channel, message) = (http.clone(), *channel, *message);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(120)).await;
-                        let _ = channel
-                            .edit_message(&http, message, EditMessage::new().components(vec![]))
-                            .await;
-                    });
-                }
-                if let Some(duration) = delete_after {
-                    let (http, channel, message) = (http.clone(), *channel, *message);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(duration).await;
-                        let _ = channel.delete_message(&http, message).await;
-                    });
-                }
-                Ok(())
-            }
-            Reply::Text {
-                http,
-                channel,
                 to,
                 sent,
             } => {
-                let mut reply = CreateMessage::new()
-                    .reference_message((*channel, *to))
-                    .allowed_mentions(none());
-                if let Some(t) = text {
-                    reply = reply.content(t);
-                }
-                if let Some(e) = embed {
-                    reply = reply.embed(e).components(rows);
-                }
-                let message_id = channel.send_message(&**http, reply).await?.id;
-                *sent = Some(message_id);
+                let message_id = match *sent {
+                    Some(message) => {
+                        let mut edit = EditMessage::new()
+                            .content(text.unwrap_or_default())
+                            .allowed_mentions(none());
+                        if let Some(e) = embed {
+                            edit = edit.embed(e).components(rows);
+                        }
+                        channel.edit_message(&**http, message, edit).await?;
+                        message
+                    }
+                    None => {
+                        let mut reply = CreateMessage::new()
+                            .reference_message((*channel, *to))
+                            .allowed_mentions(none());
+                        if let Some(t) = text {
+                            reply = reply.content(t);
+                        }
+                        if let Some(e) = embed {
+                            reply = reply.embed(e).components(rows);
+                        }
+                        let message_id = channel.send_message(&**http, reply).await?.id;
+                        *sent = Some(message_id);
+                        message_id
+                    }
+                };
                 if has_buttons {
                     let (http, channel) = (http.clone(), *channel);
                     tokio::spawn(async move {
@@ -519,7 +526,22 @@ impl Bot {
     /// Runs a command and answers it. A slow one answers at once: a text command with what it's
     /// doing, changed as it goes, and a slash command with Discord's "thinking...".
     async fn answer(self: &Arc<Self>, ctx: &Context, name: &str, req: Request, mut reply: Reply) {
-        let first = first_status(name, &req.args);
+        if !COMMANDS.contains(&name) {
+            return;
+        }
+        if let Err(why) = self.allowed(name, &req) {
+            debug!(
+                "{}: command {name} not allowed for {}: {why}",
+                self.name, req.user
+            );
+            if let Err(e) = reply.show(private(why)).await {
+                error!("{}: answering {name}: {e}", self.name);
+            }
+            return;
+        }
+        let first = first_status(name, &req.args).or_else(|| {
+            (name == "skip" && self.skip_needs_lookup(req.guild)).then(|| "Skipping...".into())
+        });
         let (status, mut changes) = watch::channel(first.clone().unwrap_or_default());
         let text = matches!(reply, Reply::Text { .. });
         if let Some(first) = first
@@ -555,23 +577,13 @@ impl Bot {
         req: Request,
         status: &watch::Sender<String>,
     ) -> Option<Said> {
-        if !commands().iter().any(|c| command_name(c) == name) {
-            return None;
-        }
-        if let Err(why) = self.allowed(name, &req) {
-            debug!(
-                "{}: command {name} not allowed for {}: {why}",
-                self.name, req.user
-            );
-            return Some(private(why));
-        }
         debug!(
             "{}: running command {name} (args: {:?}) for {}",
             self.name, req.args, req.user
         );
         Some(match name {
             "play" => self.play(req, status).await,
-            "skip" => self.skip(req.guild),
+            "skip" => self.skip(req.guild).await,
             "prev" => self.prev(req.guild, "Back to").await,
             "replay" => self.replay(req.guild).await,
             "clear" => self.clear(req.guild),
@@ -746,16 +758,64 @@ impl Bot {
         call.deafen(true).await
     }
 
-    fn skip(&self, guild: GuildId) -> Said {
-        let skipped = self.with_guild(guild, |g| {
-            let current = g.current.as_mut()?;
-            current.skipped = true;
-            let _ = current.handle.stop();
-            Some(describe(&current.track))
-        });
-        skipped.map_or(private("Nothing is playing."), |title| {
-            format!("Skipped {title}").into()
+    fn skip_needs_lookup(&self, guild: GuildId) -> bool {
+        let finder = &self.settings.finder;
+        self.with_guild(guild, |g| {
+            g.current.as_ref()?;
+            let next = g.queue.front()?;
+            Some(!next.ready() && !next.on_spotify(finder))
         })
+        .unwrap_or(false)
+    }
+
+    async fn skip(self: &Arc<Self>, guild: GuildId) -> Said {
+        let skipped = self.with_guild(guild, |g| {
+            if g.loading {
+                return Some(Err("Still loading a track, try again in a moment."));
+            }
+            // taken first, so its End event finds nothing to move on from
+            let Current {
+                mut track, handle, ..
+            } = g.current.take()?;
+            let _ = handle.stop();
+            let what = describe(&track);
+            track.retried = false;
+            match g.looping {
+                Loop::Queue => {
+                    g.remember(track.clone());
+                    g.queue.push_back(track);
+                }
+                _ => g.remember(track),
+            }
+            let advance = !g.queue.is_empty();
+            if advance {
+                g.loading = true;
+            }
+            let old_announcement = g.announcement.take();
+            Some(Ok((what, advance, old_announcement)))
+        });
+        let (what, advance, old_announcement) = match skipped {
+            Some(Ok(v)) => v,
+            Some(Err(why)) => return private(why),
+            None => return private("Nothing is playing."),
+        };
+        if let Some((channel, message)) = old_announcement
+            && let Some(http) = self.http.get().cloned()
+        {
+            tokio::spawn(async move {
+                let _ = channel.delete_message(&http, message).await;
+            });
+        }
+        if !advance {
+            self.refresh(guild);
+            return format!("Skipped {what}").into();
+        }
+        self.play_next(guild, false).await;
+        let next = self.with_guild(guild, |g| Some(describe(&g.current.as_ref()?.track)));
+        match next {
+            Some(next) => format!("Skipped {what}\nNow playing {next}").into(),
+            None => format!("Skipped {what}").into(),
+        }
     }
 
     async fn now_playing(&self, guild: GuildId) -> Option<String> {
@@ -852,28 +912,21 @@ impl Bot {
         let (Ok(guild), Ok(page)) = (guild.parse().map(GuildId::new), page.parse()) else {
             return;
         };
-        let empty = self
-            .with_guild(guild, |g| Some(g.queue.is_empty()))
-            .unwrap_or(true);
-        if empty {
-            let _ = comp
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::UpdateMessage(
-                        CreateInteractionResponseMessage::new().components(vec![]),
-                    ),
-                )
-                .await;
+        if comp.guild_id != Some(guild) {
             return;
         }
-        if let Some((embed, row)) = self.queue_embed(guild, page).await {
-            let resp = CreateInteractionResponseMessage::new()
+        let resp = match self.queue_embed(guild, page).await {
+            Some((embed, row)) => CreateInteractionResponseMessage::new()
                 .embed(embed)
-                .components(row.into_iter().collect());
-            let _ = comp
-                .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(resp))
-                .await;
-        }
+                .components(row.into_iter().collect()),
+            None => CreateInteractionResponseMessage::new()
+                .content("Nothing is playing.")
+                .embeds(vec![])
+                .components(vec![]),
+        };
+        let _ = comp
+            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(resp))
+            .await;
     }
 
     fn pause(self: &Arc<Self>, guild: GuildId, pause: bool) -> Said {
@@ -985,7 +1038,11 @@ impl Bot {
         match handle.seek(to).result_async().await {
             Ok(at) => {
                 self.with_guild(req.guild, |g| {
-                    if let Some(c) = g.current.as_mut() {
+                    if let Some(c) = g
+                        .current
+                        .as_mut()
+                        .filter(|c| c.handle.uuid() == handle.uuid())
+                    {
                         c.at = at;
                         c.started = Instant::now();
                     }
@@ -1077,7 +1134,11 @@ impl Bot {
         match handle.seek(Duration::ZERO).result_async().await {
             Ok(_) => {
                 self.with_guild(guild, |g| {
-                    if let Some(c) = g.current.as_mut() {
+                    if let Some(c) = g
+                        .current
+                        .as_mut()
+                        .filter(|c| c.handle.uuid() == handle.uuid())
+                    {
                         c.at = Duration::ZERO;
                         c.started = Instant::now();
                     }
@@ -1311,6 +1372,7 @@ fn first_status(name: &str, args: &str) -> Option<String> {
     Some(text.into())
 }
 
+#[cfg(test)]
 fn command_name(command: &CreateCommand) -> String {
     let json = serde_json::to_value(command).unwrap_or_default();
     json["name"].as_str().unwrap_or_default().to_string()
@@ -1352,37 +1414,30 @@ fn describe(track: &source::Track) -> String {
     link(track) + &length
 }
 
-/// The title in bold, linked without an embed. Long titles are cut so a queue fits in one message.
-fn link(track: &source::Track) -> String {
-    // Discord shows backslash escapes in link text as typed, so whatever could break the link
-    // or the bold becomes a look-alike
-    let title: String = track
-        .title
+/// Discord shows backslash escapes in link text as typed, so whatever could break the link or
+/// bold becomes a look-alike. Long titles are cut so a queue fits in one message.
+fn escape_title(title: &str) -> String {
+    title
         .chars()
         .take(100)
         .map(|c| match c {
             '[' => '\u{ff3b}',
             ']' => '\u{ff3d}',
             '*' => '\u{2217}',
+            '\n' | '\r' => ' ',
             c => c,
         })
-        .collect();
-    format!("**[{title}](<{}>)**", track.page())
+        .collect()
+}
+
+/// The title in bold, linked without an embed.
+fn link(track: &source::Track) -> String {
+    format!("**[{}](<{}>)**", escape_title(&track.title), track.page())
 }
 
 /// The playlist title in bold, linked without an embed, followed by its kind (e.g. YouTube playlist).
 fn playlist_link(playlist: &source::Playlist) -> String {
-    let title: String = playlist
-        .title
-        .chars()
-        .take(100)
-        .map(|c| match c {
-            '[' => '\u{ff3b}',
-            ']' => '\u{ff3d}',
-            '*' => '\u{2217}',
-            c => c,
-        })
-        .collect();
+    let title = escape_title(&playlist.title);
     if playlist.url.is_empty() {
         format!("**{title}** {}", playlist.kind)
     } else {
@@ -1413,9 +1468,19 @@ mod tests {
     #[test]
     fn command_lists_match() {
         let names: Vec<String> = commands().iter().map(command_name).collect();
-        let listed = ALIASES.iter().map(|(_, n)| n).chain(OPEN);
+        assert_eq!(names.len(), COMMANDS.len());
+        let listed = COMMANDS
+            .iter()
+            .chain(ALIASES.iter().map(|(_, n)| n))
+            .chain(OPEN);
         for name in listed {
             assert!(names.iter().any(|n| n == name), "{name} isn't a command");
+        }
+        for name in &names {
+            assert!(
+                COMMANDS.contains(&name.as_str()),
+                "{name} missing from COMMANDS"
+            );
         }
         let help = help("t.", true);
         assert!(help.contains("`seek <time>`") && help.contains("`play <track>` (`p`)"));
