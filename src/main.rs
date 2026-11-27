@@ -65,6 +65,7 @@ async fn main() -> ExitCode {
         .with(filter)
         .init();
 
+    info!("musicart v{} starting", env!("CARGO_PKG_VERSION"));
     if level >= Level::DEBUG {
         tracing::debug!("debug logging enabled (dev profile: {dev}, level: {level})");
     }
