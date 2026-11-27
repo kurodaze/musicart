@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 use tracing::info;
 
@@ -35,6 +35,7 @@ static SYSTEM_DENO: LazyLock<bool> = LazyLock::new(|| {
 /// told with `--js-runtimes`.
 pub async fn ready() -> Result<String, String> {
     static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static JS_RUNTIME: OnceLock<String> = OnceLock::new();
     let missing = |path: &str| !usable(path);
     if missing(YTDLP) || (!*SYSTEM_DENO && missing(DENO)) {
         let _turn = INSTALL.lock().await;
@@ -66,12 +67,17 @@ pub async fn ready() -> Result<String, String> {
             install(DENO, &unzip_single(&zip)?)?;
         }
     }
-    Ok(if *SYSTEM_DENO {
-        "deno".into()
-    } else {
-        let path = fs::canonicalize(DENO).unwrap_or_else(|_| PathBuf::from(DENO));
-        format!("deno:{}", path.display())
-    })
+    let spec = JS_RUNTIME.get_or_init(|| {
+        let spec = if *SYSTEM_DENO {
+            "deno".into()
+        } else {
+            let path = fs::canonicalize(DENO).unwrap_or_else(|_| PathBuf::from(DENO));
+            format!("deno:{}", path.display())
+        };
+        info!("yt-dlp EJS runtime {spec}");
+        spec
+    });
+    Ok(spec.clone())
 }
 
 /// A release asset, checked against its published SHA-256.

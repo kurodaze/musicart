@@ -184,7 +184,7 @@ impl Ytdlp {
             Ok(cookies) => Some(cookies),
             Err(e) => {
                 if !COOKIES_MISSING.swap(true, Ordering::Relaxed) {
-                    warn!("cookies: couldn't read {file} ({e}), looking things up logged out");
+                    warn!("cookies: couldn't load {file}: {e}, continuing without cookies");
                 }
                 None
             }
@@ -204,7 +204,7 @@ impl Ytdlp {
             let cookies_path = self.cookies_file();
             let file = cookies_path.as_deref().unwrap_or_default();
             warn!(
-                "cookies: YouTube no longer accepts the ones in {file}, looking things up logged out. Export new ones, see the README"
+                "cookies: YouTube no longer accepts the ones in {file}. Export new ones, see the README"
             );
         }
     }
